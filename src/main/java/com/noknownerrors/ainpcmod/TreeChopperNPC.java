@@ -113,6 +113,7 @@ public class TreeChopperNPC extends AbstractVillager {
         @Override
         public boolean canUse() {
             if (npc.hasPlacedCraftingTable()) return false;
+            if (isChoppingTree) return false;
             targetTree = findNearestLog();
             return targetTree != null;
         }
@@ -135,7 +136,11 @@ public class TreeChopperNPC extends AbstractVillager {
         public void tick() {
             if (targetTree != null) {
                 if (npc.distanceToSqr(targetTree.getX(), targetTree.getY(), targetTree.getZ()) <= CHOP_RADIUS * CHOP_RADIUS) {
-                    chopTree(targetTree);
+                    if (isChoppingTree) {
+                        System.out.println("Already chopping a tree. Skipping this tick.");
+                    } else {
+                        chopTree(targetTree);
+                    }
                 } else if (!npc.getNavigation().isInProgress()) {
                     if (stuckTicks >= MAX_STUCK_TICKS) {
                         System.out.println("Got stuck while navigating to the tree. Chopping the tree from current position.");
