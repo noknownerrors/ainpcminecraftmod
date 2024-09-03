@@ -19,6 +19,7 @@ import net.minecraft.world.SimpleContainer;
 import net.minecraft.world.entity.ai.attributes.AttributeSupplier;
 import net.minecraft.world.entity.ai.attributes.Attributes;
 import net.minecraft.world.entity.ai.goal.*;
+import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.InteractionResult;
 import net.minecraft.network.chat.Component;
@@ -27,20 +28,38 @@ import net.minecraft.world.item.trading.MerchantOffer;
 import net.minecraft.tags.BlockTags;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.AABB;
+import net.minecraft.world.entity.player.Player;
+import net.minecraftforge.common.util.FakePlayer;
+import net.minecraftforge.common.util.FakePlayerFactory;
+import net.minecraftforge.items.ItemHandlerHelper;
+import net.minecraft.server.level.ServerLevel;
 import java.util.LinkedList;
 import java.util.Queue;
 import java.util.Set;
+import java.util.List;
+import java.util.UUID;
+
+import org.lwjgl.system.CallbackI.F;
+
+import com.mojang.authlib.GameProfile;
+
 import java.util.HashSet;
 
 
 
 public class TreeChopperNPC extends AbstractVillager {
-    private final SimpleContainer inventory = new SimpleContainer(16);
+    private final SimpleContainer inventory = new SimpleContainer(32);
     private boolean hasPlacedCraftingTable = false;
-    private static boolean isChoppingTree = false;
+    protected boolean isChoppingTree = false;
+    protected UUID uuid = null;
+    GameProfile gameProfile = null;
+    private int breakProgress = 0;
 
     public TreeChopperNPC(EntityType<? extends AbstractVillager> entityType, Level level) {
         super(entityType, level);
+        this.uuid = UUID.randomUUID();
+        this.gameProfile = new GameProfile(uuid, "TreeChopperNPC");
     }
 
     public static AttributeSupplier.Builder createAttributes() {
@@ -51,13 +70,59 @@ public class TreeChopperNPC extends AbstractVillager {
     }
 
     @Override
+    public void aiStep() {
+        super.aiStep();
+        if (!this.level.isClientSide && this.isAlive()) {
+            this.pickUpNearbyItems();
+        }
+    }
+
+    private void pickUpNearbyItems() {
+        AABB boundingBox = this.getBoundingBox().inflate(1.0D, 0.0D, 1.0D);
+        List<ItemEntity> items = this.level.getEntitiesOfClass(ItemEntity.class, boundingBox);
+        for (ItemEntity itemEntity : items) {
+            if (!itemEntity.isRemoved() && !itemEntity.getItem().isEmpty()) {
+                this.takeItem(itemEntity);
+            }
+        }
+    }
+
+    private void takeItem(ItemEntity itemEntity) {
+        ItemStack itemStack = itemEntity.getItem();
+        ItemStack remainingStack = this.inventory.addItem(itemStack);
+        if (remainingStack.isEmpty()) {
+            itemEntity.discard();
+        } else {
+            itemEntity.setItem(remainingStack);
+        }
+    }
+
+    protected boolean breakBlockTick(BlockPos pos, int ticksToBreak) {
+        if (this.breakProgress < ticksToBreak) {
+            this.swing(InteractionHand.MAIN_HAND);
+            breakProgress++;
+            return false;
+        } else {
+            ServerLevel serverLevel = (ServerLevel) this.level;
+            BlockState blockState = serverLevel.getBlockState(pos);
+            Player fakePlayer = FakePlayerFactory.get(serverLevel, this.gameProfile);
+            blockState.getBlock().playerDestroy(serverLevel, fakePlayer, pos, blockState, null, ItemStack.EMPTY);
+            this.level.destroyBlock(pos, false);
+            this.breakProgress = 0;
+            return true;
+        }
+    }
+
+    @Override
     protected void registerGoals() {
         this.goalSelector.addGoal(0, new FloatGoal(this));
         this.goalSelector.addGoal(1, new CreateCraftingTableGoal(this));
         this.goalSelector.addGoal(2, new ChopTreeGoal(this));
         this.goalSelector.addGoal(3, new WaterAvoidingRandomStrollGoal(this, 0.6D));
-        this.goalSelector.addGoal(4, new LookAtPlayerGoal(this, Player.class, 6.0F));
-        this.goalSelector.addGoal(5, new RandomLookAroundGoal(this));
+        this.goalSelector.addGoal(6, new WalkTowardsItemGoal(this, 0.6D, 8.0F));
+        this.goalSelector.addGoal(5, new LookAtPlayerGoal(this, Player.class, 6.0F));
+        this.goalSelector.addGoal(6, new RandomLookAroundGoal(this));
+        this.goalSelector.addGoal(50, new WaterAvoidingRandomStrollGoal(this, 0.6D));
     }
 
     @Override
@@ -72,6 +137,28 @@ public class TreeChopperNPC extends AbstractVillager {
     public void setHasPlacedCraftingTable(boolean value) {
         hasPlacedCraftingTable = value;
     }
+
+    public int calculateBreakTime(BlockPos pos, ItemStack tool) {
+        ServerLevel serverLevel = (ServerLevel) this.level;
+        BlockState blockState = serverLevel.getBlockState(pos);
+    
+        // Create a fake player
+        FakePlayer fakePlayer = FakePlayerFactory.get(serverLevel, this.gameProfile);
+    
+        // Set the tool in the fake player's hand
+        fakePlayer.setItemInHand(InteractionHand.MAIN_HAND, tool);
+    
+        // Calculate the destroy speed
+        float destroySpeed = blockState.getDestroySpeed(serverLevel, pos);
+        float digSpeed = fakePlayer.getDigSpeed(blockState, pos);
+    
+        // Calculate ticks to break
+        int ticksToBreak = (int) Math.ceil(destroySpeed / digSpeed);
+    
+        System.out.println("Ticks to break: " + ticksToBreak);
+        return ticksToBreak;
+    }
+
 
     @Override
     public InteractionResult mobInteract(Player player, InteractionHand hand) {
@@ -96,75 +183,135 @@ public class TreeChopperNPC extends AbstractVillager {
         }
     }
 
+    public class WalkTowardsItemGoal extends Goal {
+        private final AbstractVillager npc;
+        private final double speed;
+        private final float maxDistance;
+        private ItemEntity targetItem;
+    
+        public WalkTowardsItemGoal(AbstractVillager npc, double speed, float maxDistance) {
+            this.npc = npc;
+            this.speed = speed;
+            this.maxDistance = maxDistance;
+            this.setFlags(EnumSet.of(Goal.Flag.MOVE));
+        }
+    
+        @Override
+        public boolean canUse() {
+            List<ItemEntity> nearbyItems = npc.level.getEntitiesOfClass(ItemEntity.class, npc.getBoundingBox().inflate(maxDistance));
+            if (!nearbyItems.isEmpty()) {
+                targetItem = nearbyItems.get(0);
+                return true;
+            }
+            return false;
+        }
+    
+        @Override
+        public boolean canContinueToUse() {
+            return targetItem != null && !targetItem.isRemoved() && npc.distanceToSqr(targetItem) > 1.0;
+        }
+    
+        @Override
+        public void start() {
+            npc.getNavigation().moveTo(targetItem, speed);
+        }
+    
+        @Override
+        public void stop() {
+            targetItem = null;
+            npc.getNavigation().stop();
+        }
+    
+        @Override
+        public void tick() {
+            if (targetItem != null && !targetItem.isRemoved()) {
+                npc.getNavigation().moveTo(targetItem, speed);
+            }
+        }
+    }
+
     private static class ChopTreeGoal extends Goal {
         private final TreeChopperNPC npc;
-        private BlockPos targetTree;
+        private BlockPos targetedTreeBlock;
         private final int SEARCH_RADIUS = 16;
-        private final int CHOP_RADIUS = 4;
-        private final int MAX_STUCK_TICKS = 20;
-        private int stuckTicks = 0;
-        private int breakProgress = 0;
-
+        private final int CHOP_RADIUS = 15;
+        private final int MAX_CHOP_COUNT = 16;
+        private final int BREAK_DELAY = 20; // delay between chopping trees
+        private int chopCount = 0;
+        private Set<BlockPos> visited = new HashSet<>();
+        private Queue<BlockPos> queue = new LinkedList<>();
+        private int delay = 0;
+    
         public ChopTreeGoal(TreeChopperNPC npc) {
             this.npc = npc;
             this.setFlags(EnumSet.of(Goal.Flag.MOVE));
         }
-
+    
         @Override
         public boolean canUse() {
             if (npc.hasPlacedCraftingTable()) return false;
-            if (isChoppingTree) return false;
-            targetTree = findNearestLog();
-            return targetTree != null;
+            if (npc.isChoppingTree) return false;
+            if (delay > 0) {
+                delay--;
+                return false;
+            }
+            targetedTreeBlock = findNearestLog();
+            return targetedTreeBlock != null;
         }
-
+    
         @Override
         public boolean canContinueToUse() {
-            return targetTree != null;
+            if (npc.getNavigation().isInProgress() || npc.isChoppingTree) {
+                return true;
+            } else {
+                System.out.println("Chop tree goal is no longer valid.");
+                return false;
+            }
         }
-
+    
         @Override
         public void start() {
-            if (targetTree != null) {
-                npc.getNavigation().moveTo(targetTree.getX(), targetTree.getY(), targetTree.getZ(), 1.0D);
-                System.out.println("Moving towards tree at " + targetTree);
-                stuckTicks = 0;
+            if (targetedTreeBlock == null) {
+                targetedTreeBlock = findNearestLog();
             }
+            npc.getNavigation().moveTo(targetedTreeBlock.getX(), targetedTreeBlock.getY(), targetedTreeBlock.getZ(), 1.0D);
+            System.out.println("Moving towards tree at " + targetedTreeBlock);
         }
-
+    
         @Override
         public void tick() {
-            if (targetTree != null) {
-                if (npc.distanceToSqr(targetTree.getX(), targetTree.getY(), targetTree.getZ()) <= CHOP_RADIUS * CHOP_RADIUS) {
-                    if (isChoppingTree) {
-                        System.out.println("Already chopping a tree. Skipping this tick.");
-                    } else {
-                        chopTree(targetTree);
-                    }
-                } else if (!npc.getNavigation().isInProgress()) {
-                    if (stuckTicks >= MAX_STUCK_TICKS) {
-                        System.out.println("Got stuck while navigating to the tree. Chopping the tree from current position.");
-                        chopTree(targetTree);
-                    } else {
-                        stuckTicks++;
-                    }
-                } else {
-                    stuckTicks = 0;
-                }
+            if (targetedTreeBlock == null) {
+                return;
+            }
+            if (npc.getNavigation().isInProgress()) {
+                System.out.println("navigation in progress to " + targetedTreeBlock);
+                return;
+            }
+            if (npc.distanceToSqr(targetedTreeBlock.getX(), targetedTreeBlock.getY(), targetedTreeBlock.getZ()) <= CHOP_RADIUS * CHOP_RADIUS) {
+                chopTree();
+            } else {
+                // add code to clear obstacles in the path
+                System.out.println("Logs out of chop radius, ending current goal " + targetedTreeBlock);
+                npc.getNavigation().moveTo(targetedTreeBlock.getX(), targetedTreeBlock.getY(), targetedTreeBlock.getZ(), 1.0D);
+                npc.isChoppingTree = false;
+                chopCount = 0;
+                visited.clear();
+                queue.clear();
+                delay = BREAK_DELAY;
             }
         }
-
+    
         private BlockPos findNearestLog() {
             BlockPos npcPos = npc.blockPosition();
             BlockPos nearestLog = null;
             double nearestDistanceSq = Double.MAX_VALUE;
-
+    
             for (BlockPos pos : BlockPos.betweenClosed(npcPos.offset(-SEARCH_RADIUS, -SEARCH_RADIUS, -SEARCH_RADIUS),
                     npcPos.offset(SEARCH_RADIUS, SEARCH_RADIUS, SEARCH_RADIUS))) {
                 BlockState state = npc.level.getBlockState(pos);
                 Block block = state.getBlock();
-
-                if (isTreeLog(block)) {
+    
+                if (isTreeLog(block) && npc.level.getBlockState(pos.below()).getMaterial().isSolid()) {
                     double distanceSq = pos.distSqr(npcPos);
                     if (distanceSq < nearestDistanceSq) {
                         nearestLog = pos.immutable();
@@ -172,78 +319,50 @@ public class TreeChopperNPC extends AbstractVillager {
                     }
                 }
             }
-
+    
             if (nearestLog != null) {
                 System.out.println("Found nearest log at " + nearestLog);
             } else {
                 System.out.println("No logs found within search radius.");
             }
-
+    
             return nearestLog;
         }
-
-        private void chopTree(BlockPos pos) {
-            Set<BlockPos> visited = new HashSet<>();
-            Queue<BlockPos> queue = new LinkedList<>();
-            queue.add(pos);
     
-            while (!queue.isEmpty()) {
-                isChoppingTree = true;
-                BlockPos current = queue.poll();
-                if (visited.contains(current) || !isWithinChopRadius(current)) {
-                    continue;
-                }
-    
-                visited.add(current);
-                BlockState state = npc.level.getBlockState(current);
-                Block block = state.getBlock();
-    
-                if (isTreeBlock(block)) {
-                    if (isTreeLog(block)) {
-                        equipBestAxe();
-                    }
-                    breakBlock(current, block);
-                    if (isTreeLog(block)) {
-                        npc.getInventory().addItem(new ItemStack(block));
-                        System.out.println("Chopped log at " + current + ". Current log count: " + npc.getInventory().countItem(Items.OAK_LOG));
-                    }
-                }
-    
-                for (BlockPos neighbor : getNeighbors(current)) {
-                    if (hasSpaceToMove(neighbor)) {
-                        npc.getNavigation().moveTo(neighbor.getX(), neighbor.getY(), neighbor.getZ(), 1.0D);
-                    }
-                    if (!visited.contains(neighbor) && isTreeBlock(npc.level.getBlockState(neighbor).getBlock())) {
-                        queue.add(neighbor);
-                    }
+        private void chopTree() {
+            npc.isChoppingTree = true;
+            equipBestAxe();
+            int ticksToBreak = npc.calculateBreakTime(targetedTreeBlock, npc.getItemInHand(InteractionHand.MAIN_HAND));
+            if (npc.breakBlockTick(targetedTreeBlock, ticksToBreak)) {
+                chopCount++;
+                System.out.println("Chopped log at " + targetedTreeBlock);
+            } else {
+                return;
+            }
+            for (BlockPos neighbor : getNeighbors(targetedTreeBlock)) {
+                if (!visited.contains(neighbor) && isTreeLog(npc.level.getBlockState(neighbor).getBlock())) {
+                    queue.add(neighbor.immutable());
+                    visited.add(neighbor.immutable());
                 }
             }
-            isChoppingTree = false;
-            targetTree = findNearestLog();
-        }
-
-        private void breakBlock(BlockPos pos, Block block) {
-            float hardness = block.defaultBlockState().getDestroySpeed(npc.level, pos);
-            int ticksToBreak;
-            if (isTreeLog(block)) {
-                ticksToBreak = (int) (1.5f / hardness);
-            } else {
-                ticksToBreak = (int) (0.5f / hardness);
+            targetedTreeBlock = queue.poll();
+            if (targetedTreeBlock != null) {
+                npc.getNavigation().moveTo(targetedTreeBlock.getX(), targetedTreeBlock.getY(), targetedTreeBlock.getZ(), 1.0D);
             }
-    
-            if (breakProgress < ticksToBreak) {
-                npc.swing(InteractionHand.MAIN_HAND);
-                breakProgress++;
-            } else {
-                npc.level.destroyBlock(pos, false);
-                breakProgress = 0;
+            if (targetedTreeBlock == null || chopCount >= MAX_CHOP_COUNT) {
+                System.out.println("Finished chopping tree.");
+                npc.isChoppingTree = false;
+                chopCount = 0;
+                visited.clear();
+                queue.clear();
+                delay = BREAK_DELAY;
             }
         }
-
+    
         private void equipBestAxe() {
             float bestAxeSpeed = -1.0f;
             int bestAxeSlot = -1;
-        
+    
             for (int i = 0; i < npc.getInventory().getContainerSize(); i++) {
                 ItemStack item = npc.getInventory().getItem(i);
                 if (item.getItem() instanceof AxeItem) {
@@ -254,36 +373,30 @@ public class TreeChopperNPC extends AbstractVillager {
                     }
                 }
             }
-        
+    
             if (bestAxeSlot != -1) {
                 npc.setItemInHand(InteractionHand.MAIN_HAND, npc.getInventory().getItem(bestAxeSlot));
             } else {
                 npc.setItemInHand(InteractionHand.MAIN_HAND, ItemStack.EMPTY);
             }
         }
-
+    
         private boolean isWithinChopRadius(BlockPos pos) {
-            return pos.distSqr(targetTree) <= CHOP_RADIUS * CHOP_RADIUS;
+            return pos.distSqr(targetedTreeBlock) <= CHOP_RADIUS * CHOP_RADIUS;
         }
-
-        private boolean hasSpaceToMove(BlockPos pos) {
-            BlockState state = npc.level.getBlockState(pos);
-            return state.isAir() || !state.getMaterial().blocksMotion();
-        }
-
+    
         private Iterable<BlockPos> getNeighbors(BlockPos pos) {
             return BlockPos.betweenClosed(pos.offset(-1, -1, -1), pos.offset(1, 1, 1));
         }
-
+    
         private boolean isTreeLog(Block block) {
             return block.defaultBlockState().is(BlockTags.LOGS);
         }
-
-        private boolean isTreeBlock(Block block) {
-            return isTreeLog(block) || block.defaultBlockState().is(BlockTags.LEAVES);
+    
+        private boolean isTreeLeaves(Block block) {
+            return block.defaultBlockState().is(BlockTags.LEAVES);
         }
     }
-    
 
     private static class CreateCraftingTableGoal extends Goal {
         private final TreeChopperNPC npc;
@@ -297,7 +410,7 @@ public class TreeChopperNPC extends AbstractVillager {
     
         @Override
         public boolean canUse() {
-            if (isChoppingTree) {
+            if (npc.isChoppingTree) {
                 return false;
             }
     
